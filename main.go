@@ -115,6 +115,7 @@ func doit() {
 	// infinite loop
 	for {
 		log.Println("main: before imaploop")
+
 		if err := ImapLoop(chWdog); err != nil {
 			log.Println("main: error imaploop, telling watchdog and sleeping 1 minute: ", err)
 			chWdog <- err
@@ -141,5 +142,5 @@ func main() {
 	log.Printf("  test timeout var: %v, %v", Conf.ConfImap.IdleTimeout, Conf.IdleTimeout)
 
 	doit()
-
+	// Usage()
 }

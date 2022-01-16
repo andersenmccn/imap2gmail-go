@@ -10,10 +10,14 @@ import (
 	"github.com/emersion/go-imap"
 	idle "github.com/emersion/go-imap-idle"
 	"github.com/emersion/go-imap/client"
+	"github.com/emersion/go-message/charset"
 )
 
 func imapGetClient() (*client.Client, error) {
 	log.Println("imapGetClient: connecting...")
+
+	imap.CharsetReader = charset.Reader
+
 	c, err := client.DialTLS(Conf.ConfImap.Server+":"+strconv.Itoa(Conf.ConfImap.Port), nil)
 	if err != nil {
 		return nil, errors.New("imapGetClient dial: " + err.Error())
@@ -72,17 +76,31 @@ func imapMoveTo(c *client.Client, seqset *imap.SeqSet, targetFolder string) erro
 	return nil
 }
 
-func imapHandleFirstMsg(c *client.Client, mbox *imap.MailboxStatus) error {
+func imapHandleFirstMsg(mId uint32, c *client.Client, mbox *imap.MailboxStatus) error {
 	log.Println("handlefirst: begin")
+
 	seqset := new(imap.SeqSet)
-	seqset.AddNum(mbox.Messages) // newest message first
+	seqset.AddNum(mId) // newest message first
+	log.Printf("handlefirst: seqset: %v", seqset)
+
+	items := []imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags, imap.FetchRFC822Size}
+	log.Printf("handlefirst: items: %v", items)
+
 	messages := make(chan *imap.Message, 1)
-	done := make(chan error, 1)
+	log.Printf("handlefirst: messages: %v", messages)
+
+	// done := make(chan error, 1)
+
 	log.Println("handlefirst: get first message envelope & size")
 	go func() {
-		done <- c.Fetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchRFC822Size}, messages)
+		if err := c.Fetch(seqset, items, messages); err != nil {
+			log.Fatalf("handlefirst: fetch messages error: %v", err)
+		}
 	}()
+
 	msg := <-messages
+	log.Printf("handlefirst: msg: %v", msg)
+
 	if msg == nil {
 		return errors.New("Couldn't get first message envelope & size")
 	}
@@ -98,10 +116,11 @@ func imapHandleFirstMsg(c *client.Client, mbox *imap.MailboxStatus) error {
 
 	log.Println("handlefirst: get first message raw")
 	messages = make(chan *imap.Message, 1) // channels need to be reopened
-	done = make(chan error, 1)
 	section := &imap.BodySectionName{}
 	go func() {
-		done <- c.Fetch(seqset, []imap.FetchItem{section.FetchItem()}, messages)
+		if err := c.Fetch(seqset, []imap.FetchItem{section.FetchItem()}, messages); err != nil {
+			log.Fatalf("handlefirst: fetch body error: %v", err)
+		}
 	}()
 	msg = <-messages
 	if msg == nil {
@@ -111,9 +130,7 @@ func imapHandleFirstMsg(c *client.Client, mbox *imap.MailboxStatus) error {
 	if r == nil {
 		return errors.New("Server didn't returned message body")
 	}
-	if err := <-done; err != nil {
-		return err
-	}
+
 	origlen := r.Len()
 
 	log.Printf("handlefirst: read raw... (origlen=%v)", origlen)
@@ -198,17 +215,25 @@ func ImapLoop(wdog chan error) (errres error) {
 		return err
 	}
 
+	// 搜索条件实例对象
+	criteria := imap.NewSearchCriteria()
+
+	// ALL是默认条件
+	// See RFC 3501 section 6.4.4 for a list of searching criteria.
+	criteria.WithoutFlags = []string{"ALL"}
+	ids, _ := c.Search(criteria)
+
 	for {
 		log.Printf("imaploop: have %v messages", mbox.Messages)
 
 		// move existing messages to gmail
-		for mbox.Messages > 0 {
+		for mid := range ids {
 			log.Printf("imaploop: handle first message...")
-			if err := imapHandleFirstMsg(c, mbox); err != nil {
+			if err := imapHandleFirstMsg(uint32(mid), c, mbox); err != nil {
 				log.Printf("imaploop: handle error: %v", err)
-				return err
+				// return err
 			}
-			log.Println("imaploop: import of one message done!")
+			log.Printf("imaploop: import of message %d done!", mid)
 		}
 
 		// wait clever
@@ -220,5 +245,139 @@ func ImapLoop(wdog chan error) (errres error) {
 		wdog <- nil // if no errors, silence watchdog
 
 		log.Println("imaploop: after imap idle wait")
+	}
+}
+
+func SimpleUsage() {
+	// 连接邮件服务器
+	c, err := imapGetClient()
+	if err != nil {
+		log.Fatal(err)
+	}
+	// Don't forget to logout
+	defer c.Logout()
+
+	log.Println("SELECT")
+	// 选择收件箱
+	mbox, err := c.Select("INBOX", false)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Println("FROM")
+	// 获取近50封邮件
+	from := uint32(50)
+	to := mbox.Messages
+	if mbox.Messages > 50 {
+		// We're using unsigned integers here, only subtract if the result is > 0
+		from = mbox.Messages - 50
+	}
+	seqset := new(imap.SeqSet)
+	// 设置邮件搜索范围
+	seqset.AddRange(from, to)
+
+	log.Printf("SEQSET %v", seqset)
+
+	messages := make(chan *imap.Message, 10)
+
+	log.Printf("MSG INIT %v", messages)
+	done := make(chan error, 1)
+	go func() {
+		// 抓取邮件消息体传入到messages信道
+		done <- c.Fetch(seqset, []imap.FetchItem{imap.FetchRFC822}, messages)
+	}()
+
+	log.Printf("messages %v", len(messages))
+
+	for msg := range messages {
+		if msg != nil {
+			// 打印邮件标题
+			log.Println("* " + msg.Envelope.Subject)
+		}
+	}
+
+	if err = <-done; err != nil {
+		log.Fatal(err)
+	}
+}
+
+func pop(list *[]uint32) uint32 {
+	length := len(*list)
+	lastEle := (*list)[length-1]
+	*list = (*list)[:length-1]
+	return lastEle
+}
+
+func Usage() {
+	// 连接邮件服务器
+	c, err := imapGetClient()
+	if err != nil {
+		log.Fatal(err)
+	}
+	// Don't forget to logout
+	defer c.Logout()
+
+	// 选择收件箱
+	_, err = c.Select("INBOX", false)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 搜索条件实例对象
+	criteria := imap.NewSearchCriteria()
+
+	// ALL是默认条件
+	// See RFC 3501 section 6.4.4 for a list of searching criteria.
+	criteria.WithoutFlags = []string{"ALL"}
+	ids, _ := c.Search(criteria)
+
+	for {
+		if len(ids) == 0 {
+			break
+		}
+		id := pop(&ids)
+
+		seqset := new(imap.SeqSet)
+		seqset.AddNum(id)
+		chanMessage := make(chan *imap.Message, 1)
+		go func() {
+			// 第一次fetch, 只抓取邮件头，邮件标志，邮件大小等信息，执行速度快
+			if err = c.Fetch(seqset,
+				[]imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags, imap.FetchRFC822Size},
+				chanMessage); err != nil {
+				// 【实践经验】这里遇到过的err信息是：ENVELOPE doesn't contain 10 fields
+				// 原因是对方发送的邮件格式不规范，解析失败
+				// 相关的issue: https://github.com/emersion/go-imap/issues/143
+				log.Println(seqset, err)
+			}
+		}()
+
+		message := <-chanMessage
+		if message == nil {
+			log.Println("Server didn't returned message")
+			continue
+		}
+		fmt.Printf("%v: %v bytes, flags=%v \n", message.SeqNum, message.Size, message.Flags)
+
+		log.Println(message.Envelope.Subject)
+
+		// var s imap.BodySectionName
+		// if strings.HasPrefix(message.Envelope.Subject, "subject") {
+		// 	chanMsg := make(chan *imap.Message, 1)
+		// 	go func() {
+		// 		// 这里是第二次fetch, 获取邮件MIME内容
+		// 		if err = c.Fetch(seqset, []imap.FetchItem{imap.FetchRFC822}, chanMsg); err != nil {
+		// 			log.Println(seqset, err)
+		// 		}
+		// 	}()
+
+		// 	msg := <-chanMsg
+		// 	if msg == nil {
+		// 		log.Println("Server didn't returned message")
+		// 	}
+
+		// 	log.Println(msg.Envelope.Subject)
+
+		// }
 	}
 }

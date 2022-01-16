@@ -5,6 +5,7 @@ go 1.14
 require (
 	github.com/emersion/go-imap v1.0.5
 	github.com/emersion/go-imap-idle v0.0.0-20200601154248-f05f54664cc4
+	github.com/emersion/go-message v0.11.1 // indirect
 	github.com/emersion/go-sasl v0.0.0-20200509203442-7bfe0ed36a21 // indirect
 	github.com/smartystreets/goconvey v1.6.4 // indirect
 	golang.org/x/net v0.0.0-20200904194848-62affa334b73
